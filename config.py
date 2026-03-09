@@ -34,11 +34,14 @@ def _get_optional(key: str, default: str) -> str:
     return os.getenv(key, default)
 
 
-
+# ============================================================
+# PRIM API
+# ============================================================
+# La clé est OBLIGATOIRE — sans elle le producer ne peut pas tourner
 PRIM_API_KEY: str = _get_required("PRIM_API_KEY")
 
 # URL de base de l'API PRIM
-PRIM_BASE_URL: str = _get_required("PRIM_BASE_URL")
+PRIM_BASE_URL: str = "https://prim.iledefrance-mobilites.fr/marketplace"
 
 # ============================================================
 # KAFKA
@@ -47,7 +50,7 @@ PRIM_BASE_URL: str = _get_required("PRIM_BASE_URL")
 # C'est le point d'entrée — Kafka s'occupe du reste (découverte des partitions, etc.)
 # Plusieurs brokers séparés par des virgules : "broker1:9092,broker2:9092"
 KAFKA_BOOTSTRAP_SERVERS: str = _get_optional(
-    "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"
+    "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092,localhost:9093,localhost:9094"
 )
 
 # ============================================================
@@ -94,5 +97,5 @@ def validate_config() -> None:
     print(f"   TOPIC passages          : {KAFKA_TOPIC_PASSAGES}")
     print(f"   TOPIC alerts            : {KAFKA_TOPIC_ALERTS}")
     print(f"   Poll interval           : {POLL_INTERVAL_SECONDS}s")
-    print(f"   PRIM_BASE_URL           : {PRIM_BASE_URL}")
+    # On n'affiche PAS la clé API — bonne pratique de sécurité
     print(f"   PRIM_API_KEY            : ***{PRIM_API_KEY[-4:]}")

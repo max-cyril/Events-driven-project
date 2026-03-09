@@ -1,28 +1,20 @@
-# version: "3.8"
+#version: "3.8"
 
 # ============================================================
 # NETWORKS
 # ============================================================
-# On crée un réseau interne "kafka-net" pour que les containers
-# puissent se parler entre eux par leur nom (ex: "zookeeper", "kafka")
-# sans exposer ces communications à l'extérieur.
+# Réseau interne partagé par tous les containers
+# Les brokers se parlent entre eux via ce réseau
 networks:
   kafka-net:
     driver: bridge
 
-
+# ============================================================
+# SERVICES
+# ============================================================
 services:
 
-  # ----------------------------------------------------------
-  # ZOOKEEPER
-  # Kafka a besoin de Zookeeper pour gérer son état interne :
-  # - Qui est le leader parmi les brokers ?
-  # - Quels topics existent ?
-  # - Quels consumers sont connectés ?
-  # C'est le "registre central" de Kafka.
-  # Note : Kafka 3.x+ peut fonctionner sans Zookeeper (KRaft mode)
-  # mais on utilise le mode classique ici pour la clarté.
-  # ----------------------------------------------------------
+  
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -30,64 +22,117 @@ services:
       - kafka-net
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-      # Intervalle de temps (en ms) entre chaque "tick" interne
-      # Un tick = unité de base pour les timeouts et heartbeats
       ZOOKEEPER_TICK_TIME: 2000
+    # Persistance des données Zookeeper entre restarts
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
 
   # ----------------------------------------------------------
-  # KAFKA BROKER
-  # C'est le coeur du système. Le broker :
-  # - Reçoit les messages des producers
-  # - Les stocke dans des topics (partitionnés)
-  # - Les distribue aux consumers
+  # KAFKA BROKER 1 — Leader par défaut
   # ----------------------------------------------------------
-  kafka:
+  kafka-1:
     image: confluentinc/cp-kafka:7.5.0
-    container_name: kafka
+    container_name: kafka-1
     networks:
       - kafka-net
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092"
+      - "9092:9092"   # Port exposé sur ta machine pour kafka-1
     environment:
+      # Identifiant unique de ce broker dans le cluster
+      # Chaque broker DOIT avoir un BROKER_ID différent
+      KAFKA_BROKER_ID: 1
+
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
 
-      # LISTENERS : où Kafka écoute les connexions (en interne et externe)
-      # PLAINTEXT       → pour les autres containers (producer, consumer)
-      # PLAINTEXT_HOST  → pour ta machine locale (ton code Python hors Docker)
+      # Listeners internes (entre containers) et externes (ta machine)
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
-
-      # ADVERTISED_LISTENERS : adresses que Kafka annonce aux clients
-      # pour qu'ils sachent comment le rejoindre
-      # kafka:29092       → adresse interne (entre containers)
-      # localhost:9092    → adresse externe (ta machine)
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-
-      # Mapping des noms de protocoles vers les vrais protocoles
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
 
+      # MIN_ISR = minimum In-Sync Replicas
+      # 2 signifie : au moins 2 brokers doivent avoir écrit le message
+      # avant de confirmer au producer (avec acks=all)
+      # → tolérance à 1 panne (3 brokers - 1 = 2 encore disponibles)
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+
+  # ----------------------------------------------------------
+  # KAFKA BROKER 2
+  # ----------------------------------------------------------
+  kafka-2:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-2
+    networks:
+      - kafka-net
+    depends_on:
+      - zookeeper
+    ports:
+      - "9093:9093"   
+    environment:
+      KAFKA_BROKER_ID: 2  
+
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:29093,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
 
-      # On a 1 seul broker → replication factor max = 1
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
 
-      # Même chose pour le topic interne de transactions
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
 
-      # Création automatique des topics si ils n'existent pas
-      # Pratique en dev, à désactiver en prod
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+  # ----------------------------------------------------------
+  # KAFKA BROKER 3
+  # ----------------------------------------------------------
+  kafka-3:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-3
+    networks:
+      - kafka-net
+    depends_on:
+      - zookeeper
+    ports:
+      - "9094:9094"   
+    environment:
+      KAFKA_BROKER_ID: 3  
+
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29094,PLAINTEXT_HOST://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:29094,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
 
   # ----------------------------------------------------------
   # KAFDROP
-  # Interface web pour visualiser Kafka :
-  # - Liste des topics
-  # - Messages dans chaque topic
-  # - Consumers connectés
-  # → Accessible sur http://localhost:9000
-  # C'est ton "dashboard de debug" pendant le développement
+  # On lui passe les 3 brokers séparés par des virgules
+  # Il se connecte à tous et affiche le cluster complet
   # ----------------------------------------------------------
   kafdrop:
     image: obsidiandynamics/kafdrop:latest
@@ -95,12 +140,25 @@ services:
     networks:
       - kafka-net
     depends_on:
-      - kafka
+      - kafka-1
+      - kafka-2
+      - kafka-3
     ports:
       - "9000:9000"
     environment:
-      # Adresse du broker Kafka — on utilise le nom interne "kafka:29092"
-      # car Kafdrop est dans le même réseau Docker
-      KAFKA_BROKERCONNECT: kafka:29092
-      # Options JVM (Java Virtual Machine) pour limiter la RAM utilisée
-      JVM_OPTS: "-Xms32M -Xmx64M"
+      # Les 3 brokers internes — Kafdrop découvre le reste automatiquement
+      KAFKA_BROKERCONNECT: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      JVM_OPTS: "-Xms32M -Xmx128M"
+
+# ============================================================
+# VOLUMES
+# ============================================================
+# Les volumes persistent les données entre restarts Docker
+# Sans eux, toutes les données Kafka sont perdues à chaque
+# docker-compose down
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:

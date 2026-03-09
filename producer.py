@@ -18,64 +18,135 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ENVELOPPE BRONZE
+# MAPPING LIGNES → PARTITION KEY
 # ============================================================
-# On ne modifie JAMAIS le payload — c'est la donnée brute SIRI.
-# On ajoute uniquement les métadonnées pipeline qui sont
-# IMPOSSIBLES à reconstituer plus tard :
-#   - event_id    : identifiant unique déterministe (UUID v5)
-#   - ingestion_timestamp : quand notre pipeline a reçu la donnée
-#   - source      : quelle API a fourni la donnée
+# Line IDs validés depuis l'API PRIM (Mars 2026)
+# Chaque line_id PRIM est mappé vers une partition key lisible
+# Kafka hash cette clé et la mappe sur la bonne partition :
+#
+#   "rer-a"       → Partition 0
+#   "rer-b"       → Partition 1
+#   "rer-c"       → Partition 2
+#   "rer-d"       → Partition 3
+#   "rer-e"       → Partition 4
+#   "metro"       → Partition 5
+#   "bus-tramway" → Partition 6
 
-def build_envelope(payload: dict, source: str) -> dict:
+RER_LINE_MAPPING = {
+    "STIF:Line::C01371:": "rer-a",
+    "STIF:Line::C01372:": "rer-b",
+    "STIF:Line::C01373:": "rer-c",
+    "STIF:Line::C01616:": "rer-d",
+    "STIF:Line::C01374:": "rer-e",
+}
+
+# Préfixes des line_id PRIM pour identifier le mode de transport
+# On les déduit de l'observation des données réelles
+METRO_PREFIX = "STIF:Line::C0138"   # ex: C01382 = Métro 12
+TRAM_PREFIX  = "STIF:Line::C0139"   # ex: C01390 = Tram T1
+
+
+def get_partition_key(line_ref: str) -> str:
     """
-    Construit l'enveloppe Bronze autour du payload SIRI brut.
+    Mappe un line_ref PRIM complet vers une partition key lisible.
 
-    L'event_id est un UUID v5 déterministe basé sur :
-    - Le namespace URL (standard UUID)
-    - L'ItemIdentifier PRIM si disponible, sinon le hash du payload entier
-
-    Avantage : même payload = même UUID → déduplication triviale en S2
-    avec df.dropDuplicates(["event_id"])
+    Logique de priorité :
+    1. C'est un RER connu → partition dédiée (rer-a à rer-e)
+    2. C'est un Métro     → partition "metro"
+    3. C'est un Tram      → partition "bus-tramway"
+    4. Inconnu            → partition "bus-tramway" par défaut
 
     Args:
-        payload : JSON SIRI brut retourné par PrimClient (non modifié)
-        source  : nom de l'API source (ex: "prim_stop_monitoring")
+        line_ref : ex "STIF:Line::C01371:"
 
     Returns:
-        dict : enveloppe Bronze prête à être sérialisée et envoyée à Kafka
+        str : partition key ex "rer-a", "metro", "bus-tramway"
     """
+    # 1. RER — mapping exact
+    if line_ref in RER_LINE_MAPPING:
+        return RER_LINE_MAPPING[line_ref]
 
-    # On cherche l'ItemIdentifier PRIM dans le payload
-    # C'est l'ID unique de PRIM pour chaque passage — parfait pour UUID v5
-    # Structure : payload["Siri"]["ServiceDelivery"]["StopMonitoringDelivery"][0]
-    #                    ["MonitoredStopVisit"][0]["ItemIdentifier"]
+    # 2. Métro — par préfixe
+    if METRO_PREFIX in line_ref:
+        return "metro"
+
+    # 3. Tram — par préfixe
+    if TRAM_PREFIX in line_ref:
+        return "bus-tramway"
+
+    # 4. Fallback — bus ou ligne inconnue
+    logger.debug(f"⚠️ line_ref inconnu → bus-tramway par défaut : {line_ref}")
+    return "bus-tramway"
+
+
+# ============================================================
+# ARRÊTS À INTERROGER
+# ============================================================
+# Pour couvrir toutes les lignes on interroge un arrêt représentatif
+# par mode de transport.
+#
+# Format : {"name": "...", "ref": "STIF:StopArea:SP:XXXXX:"}
+#
+# Stratégie :
+# - 1 arrêt par ligne RER (validés précédemment)
+# - 1 arrêt métro central (couvre plusieurs lignes)
+# - 1 arrêt bus central
+#
+# On interroge tous ces arrêts à chaque cycle et on envoie
+# chaque réponse dans la bonne partition via get_partition_key()
+
+STOPS = [
+    # RER — arrêts validés
+    {"name": "Saint-Michel (RER A/B/C)", "ref": "STIF:StopArea:SP:22104:"},
+    {"name": "Auber (RER A)",            "ref": "STIF:StopArea:SP:22123:"},
+    {"name": "Nation (RER C)",           "ref": "STIF:StopArea:SP:22034:"},
+    {"name": "Villiers-le-Bel (RER D)",  "ref": "STIF:StopArea:SP:60640:"},
+    {"name": "Haussmann (RER E)",        "ref": "STIF:StopArea:SP:22144:"},
+
+    # Métro
+    {"name": "Trinité (Métro 12)",       "ref": "STIF:StopArea:SP:22046:"},
+
+    # Bus — à valider (arrêt Opéra)
+    {"name": "Opéra (Bus)",              "ref": "STIF:StopArea:SP:22109:"},
+]
+
+
+# ============================================================
+# ENVELOPPE BRONZE
+# ============================================================
+
+def build_envelope(payload: dict, source: str, stop_name: str) -> tuple[dict, str]:
+    """
+    Construit l'enveloppe Bronze + calcule la partition key.
+
+    On extrait le premier line_ref trouvé dans le payload
+    pour déterminer la partition key.
+
+    Returns:
+        tuple[dict, str] : (enveloppe Bronze, partition_key)
+    """
     item_identifier = _extract_item_identifier(payload)
+    line_ref        = _extract_first_line_ref(payload)
+    partition_key   = get_partition_key(line_ref) if line_ref else "bus-tramway"
 
-    if item_identifier:
-        # UUID v5 basé sur l'ItemIdentifier PRIM
-        # Même ItemIdentifier = même UUID → déduplication parfaite
-        dedup_key = f"{source}:{item_identifier}"
-    else:
-        # Fallback : UUID v5 basé sur le contenu complet du payload
-        # Moins précis mais toujours déterministe
-        dedup_key = f"{source}:{json.dumps(payload, sort_keys=True)}"
+    dedup_key = f"{source}:{item_identifier}" if item_identifier \
+                else f"{source}:{json.dumps(payload, sort_keys=True)}"
 
     event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, dedup_key))
 
-    return {
-        "event_id": event_id,
+    envelope = {
+        "event_id":            event_id,
         "ingestion_timestamp": datetime.now(timezone.utc).isoformat(),
-        "source": source,
-        "payload": payload          # ← SIRI brut, jamais modifié
+        "source":              source,
+        "stop_name":           stop_name,       # ← ajout : arrêt interrogé
+        "partition_key":       partition_key,   # ← ajout : pour traçabilité
+        "payload":             payload          # ← SIRI brut, jamais modifié
     }
+
+    return envelope, partition_key
 
 
 def _extract_item_identifier(payload: dict) -> str | None:
-    """
-    Extrait le premier ItemIdentifier trouvé dans le payload SIRI.
-    Retourne None si absent ou structure inattendue.
-    """
     try:
         visits = (
             payload["Siri"]["ServiceDelivery"]
@@ -89,60 +160,47 @@ def _extract_item_identifier(payload: dict) -> str | None:
     return None
 
 
+def _extract_first_line_ref(payload: dict) -> str | None:
+    """
+    Extrait le premier line_ref du payload SIRI.
+    Utilisé pour déterminer la partition key.
+    """
+    try:
+        visits = (
+            payload["Siri"]["ServiceDelivery"]
+                   ["StopMonitoringDelivery"][0]
+                   ["MonitoredStopVisit"]
+        )
+        if visits:
+            return (
+                visits[0]["MonitoredVehicleJourney"]
+                         ["LineRef"]["value"]
+            )
+    except (KeyError, IndexError, TypeError):
+        pass
+    return None
+
+
 # ============================================================
 # TRANSIT PRODUCER
 # ============================================================
 
 class TransitProducer:
-    """
-    Producer Kafka pour les données de transport en commun PRIM.
-
-    Responsabilités :
-    - Connexion au broker Kafka
-    - Poll de l'API PRIM à intervalle régulier
-    - Construction de l'enveloppe Bronze
-    - Publication dans les topics Kafka
-    - Gestion des erreurs et reconnexion
-    """
 
     def __init__(self):
         self.prim_client = PrimClient()
-        self.producer = self._build_producer()
+        self.producer    = self._build_producer()
 
     def _build_producer(self) -> KafkaProducer:
-        """
-        Construit le KafkaProducer avec sérialisation JSON automatique.
-
-        value_serializer : convertit automatiquement chaque message
-                           dict → bytes JSON UTF-8 avant envoi
-                           → on n'a jamais besoin de sérialiser manuellement
-
-        acks="all" : le broker confirme l'écriture sur TOUS les replicas
-                     avant d'accuser réception
-                     → garantie de durabilité maximale (important pour Bronze)
-
-        retries : nombre de tentatives si l'envoi échoue
-        """
         try:
             producer = KafkaProducer(
                 bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
-
-                # Sérialisation automatique dict → bytes JSON
                 value_serializer=lambda v: json.dumps(
                     v, ensure_ascii=False
                 ).encode("utf-8"),
-
-                # Clé sérialisée en bytes (utilisée pour le partitionnement)
                 key_serializer=lambda k: k.encode("utf-8") if k else None,
-
-                # Durabilité maximale — on ne perd aucun message Bronze
                 acks="all",
-
-                # Retry sur erreurs réseau transitoires
                 retries=3,
-
-                # Compression des messages (réduit la bande passante)
-                # lz4 = bon compromis vitesse/compression
                 compression_type="lz4",
             )
             logger.info(f"✅ Connecté à Kafka — {config.KAFKA_BOOTSTRAP_SERVERS}")
@@ -157,34 +215,13 @@ class TransitProducer:
             raise
 
     def _publish(self, topic: str, event: dict, partition_key: str) -> bool:
-        """
-        Publie un event dans un topic Kafka.
-
-        La partition_key détermine dans quelle partition le message va.
-        On utilise le line_id comme clé → tous les events d'une même ligne
-        vont dans la même partition → lecture ordonnée par ligne en S2.
-
-        Args:
-            topic         : nom du topic Kafka
-            event         : enveloppe Bronze complète
-            partition_key : clé de partitionnement (ex: "C01382")
-
-        Returns:
-            bool : True si succès, False si erreur
-        """
         try:
             future = self.producer.send(
                 topic,
                 key=partition_key,
                 value=event
             )
-
-            # get() attend la confirmation du broker (mode synchrone)
-            # timeout=10s — si pas de réponse en 10s, on considère en échec
-            # En prod haute fréquence on utiliserait le mode async avec callbacks
-            # mais pour S1 le mode synchrone est plus simple à debugger
             record_metadata = future.get(timeout=10)
-
             logger.info(
                 f"📨 Publié → topic={record_metadata.topic} "
                 f"partition={record_metadata.partition} "
@@ -199,52 +236,65 @@ class TransitProducer:
 
     def run_passages(self) -> None:
         """
-        Poll l'API PRIM et publie les passages dans Kafka.
-        Un appel = un event enveloppé (pas un event par passage).
+        Interroge TOUS les arrêts définis dans STOPS
+        et publie chaque réponse dans la bonne partition.
 
-        Pourquoi 1 event pour toute la réponse et pas 1 event par passage ?
-        → On préserve la réponse API exactement telle quelle (Bronze pur)
-        → Spark en S2 explose la liste des passages avec explode()
-        → Plus simple, plus fiable, zéro perte de contexte
+        Chaque arrêt = 1 appel API = 1 event Kafka
+        La partition est déterminée par le line_ref de la réponse
         """
-        logger.info("📡 Poll passages PRIM...")
-        raw = self.prim_client.get_passages()
+        logger.info(f"📡 Poll passages — {len(STOPS)} arrêts à interroger")
 
-        if not raw:
-            logger.warning("⚠️ Pas de données passages — skip")
-            return
+        for stop in STOPS:
+            raw = self.prim_client.get_passages(
+                monitoring_ref=stop["ref"]
+            )
 
-        # Construction de l'enveloppe Bronze
-        event = build_envelope(raw, source="prim_stop_monitoring")
+            if not raw:
+                logger.warning(f"⚠️ Pas de données pour {stop['name']} — skip")
+                continue
 
-        # Clé de partition = "passages" (toutes les réponses dans la même partition)
-        self._publish(config.KAFKA_TOPIC_PASSAGES, event, partition_key="passages")
+            # Vérifier qu'il y a bien des passages dans la réponse
+            try:
+                visits = (
+                    raw["Siri"]["ServiceDelivery"]
+                       ["StopMonitoringDelivery"][0]
+                       .get("MonitoredStopVisit", [])
+                )
+                if not visits:
+                    logger.warning(f"⚠️ Aucun passage pour {stop['name']} — skip")
+                    continue
+            except (KeyError, IndexError):
+                continue
+
+            # Construction enveloppe + partition key
+            event, partition_key = build_envelope(
+                raw,
+                source="prim_stop_monitoring",
+                stop_name=stop["name"]
+            )
+
+            logger.info(
+                f"   → {stop['name']} "
+                f"| partition: {partition_key} "
+                f"| passages: {len(visits)}"
+            )
+
+            self._publish(config.KAFKA_TOPIC_PASSAGES, event, partition_key)
 
     def run_alerts(self) -> None:
-        """
-        Poll l'API PRIM et publie les alertes dans Kafka.
-        """
-        logger.info("🚨 Poll alertes PRIM...")
         raw = self.prim_client.get_alerts()
-
         if not raw:
             logger.warning("⚠️ Pas de données alertes — skip")
             return
 
-        event = build_envelope(raw, source="prim_general_message")
-        self._publish(config.KAFKA_TOPIC_ALERTS, event, partition_key="alerts")
+        event, partition_key = build_envelope(
+            raw,
+            source="prim_general_message",
+            stop_name="global"
+        )
+        self._publish(config.KAFKA_TOPIC_ALERTS, event, "alerts")
 
     def run(self) -> None:
-        """
-        Boucle principale du producer.
-
-        Toutes les POLL_INTERVAL_SECONDS :
-        - Poll passages
-        - Poll alertes (moins fréquent : toutes les 5 minutes)
-
-        On compte les cycles pour réduire la fréquence des alertes
-        sans avoir deux boucles séparées.
-        """
         logger.info(f"🚀 Producer démarré — poll toutes les {config.POLL_INTERVAL_SECONDS}s")
         config.validate_config()
 
@@ -255,26 +305,19 @@ class TransitProducer:
                 cycle += 1
                 logger.info(f"--- Cycle #{cycle} ---")
 
-                # Passages : chaque cycle
                 self.run_passages()
 
-                # Alertes : tous les 5 cycles (toutes les ~5 minutes)
-                # Les perturbations changent moins souvent que les passages
+                # Alertes toutes les 5 minutes
                 if cycle % 5 == 0:
                     self.run_alerts()
 
-                # Flush : force l'envoi de tous les messages en attente
-                # avant de dormir (important avec la compression lz4)
                 self.producer.flush()
-
                 logger.info(f"💤 Attente {config.POLL_INTERVAL_SECONDS}s...")
                 time.sleep(config.POLL_INTERVAL_SECONDS)
 
         except KeyboardInterrupt:
             logger.info("⛔ Arrêt manuel du producer (Ctrl+C)")
         finally:
-            # On ferme proprement la connexion Kafka
-            # flush() final pour ne perdre aucun message en attente
             self.producer.flush()
             self.producer.close()
             logger.info("✅ Producer arrêté proprement")
